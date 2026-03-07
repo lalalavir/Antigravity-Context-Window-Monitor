@@ -32,6 +32,13 @@ export interface ModelUsageInfo {
     cacheReadTokens: number;
 }
 
+/** Per-checkpoint model usage — used for segmented cost calculation across model switches. */
+export interface CheckpointModelUsage {
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+}
+
 export interface TokenUsageResult {
     /** Actual input tokens from the last checkpoint (if available) */
     inputTokens: number;
@@ -59,6 +66,10 @@ export interface TokenUsageResult {
     checkpointCompressionDetected: boolean;
     /** v1.5.1: Size of the inputTokens drop between consecutive checkpoints (0 if none) */
     checkpointCompressionDrop: number;
+    /** Per-checkpoint model usage data for segmented cost calculation */
+    checkpointUsages: CheckpointModelUsage[];
+    /** Per-model estimated overhead since the last checkpoint (for delta-based cost attribution) */
+    postCheckpointModelDeltas: CheckpointModelUsage[];
 }
 
 // ─── Token Estimation Constants ──────────────────────────────────────────────
@@ -128,7 +139,24 @@ export interface ContextUsage {
     previousContextUsed?: number;
     /** CR-C3: True when step data may be incomplete (batch fetch gaps) */
     hasGaps: boolean;
+    /** Per-checkpoint model usage data for segmented cost calculation */
+    checkpointUsages: CheckpointModelUsage[];
+    /** Per-model estimated overhead since the last checkpoint (for delta-based cost attribution) */
+    postCheckpointModelDeltas: CheckpointModelUsage[];
 }
+
+// ─── Primary Model Whitelist ──────────────────────────────────────────────────
+// Only these user-selectable models should be treated as the "active" model.
+// Auxiliary models (e.g. Gemini 2.5 Flash Lite used for routing/planning)
+// are ignored to prevent transient model display flicker.
+const PRIMARY_MODELS = new Set([
+    'MODEL_PLACEHOLDER_M37',              // Gemini 3.1 Pro (High)
+    'MODEL_PLACEHOLDER_M36',              // Gemini 3.1 Pro (Low)
+    'MODEL_PLACEHOLDER_M18',              // Gemini 3 Flash
+    'MODEL_PLACEHOLDER_M35',              // Claude Sonnet 4.6 (Thinking)
+    'MODEL_PLACEHOLDER_M26',              // Claude Opus 4.6 (Thinking)
+    'MODEL_OPENAI_GPT_OSS_120B_MEDIUM',   // GPT-OSS 120B (Medium)
+]);
 
 // ─── Model Context Limits ─────────────────────────────────────────────────────
 // Real model IDs discovered from Antigravity LS via GetUserStatus API.
@@ -415,6 +443,19 @@ export function processSteps(steps: Array<Record<string, unknown>>): TokenUsageR
     let prevCheckpointInputTokens = -1; // -1 = no previous checkpoint yet
     let checkpointCompressionDetected = false;
     let checkpointCompressionDrop = 0;
+    const checkpointUsages: CheckpointModelUsage[] = [];
+    // Deferred checkpoint: model detection runs AFTER checkpoint extraction in the
+    // same loop iteration, so we buffer the checkpoint data and push it after
+    // requestedModel has been processed (ensures correct model attribution on switch).
+    let pendingCp: { inputTokens: number; outputTokens: number } | null = null;
+    // Dedup: The LS batch API may return overlapping/duplicate steps across
+    // multiple batch requests, causing the same checkpoint to be counted N times.
+    // Track seen checkpoint signatures to ensure each unique checkpoint is counted once.
+    const seenCheckpoints = new Set<string>();
+    // Per-model delta tracking: accumulates overhead per model since the last
+    // checkpoint. This data persists regardless of UI model switching.
+    const postCpModelDeltas = new Map<string, number>();
+    let prevOverhead = 0;
 
     for (let globalStepIdx = 0; globalStepIdx < steps.length; globalStepIdx++) {
         const step = steps[globalStepIdx];
@@ -458,6 +499,15 @@ export function processSteps(steps: Array<Record<string, unknown>>): TokenUsageR
         // Detect image generation steps (by stepType)
         // Nano Banana Pro is used for image generation within Gemini 3.0/3.1 Pro conversations
         // Use a Set to prevent the same step from being counted twice
+
+        // Per-model delta: attribute this step's incremental overhead to the
+        // current model BEFORE checkpoint reset happens (so the overhead is
+        // captured before being cleared). Model is from previous step's detection.
+        const stepIncrement = estimationOverhead - prevOverhead;
+        if (stepIncrement > 0 && model) {
+            postCpModelDeltas.set(model, (postCpModelDeltas.get(model) || 0) + stepIncrement);
+        }
+        prevOverhead = estimationOverhead;
         if (stepType.includes('IMAGE') || stepType.includes('GENERATE')) {
             if (!imageGenStepIndices.has(globalStepIdx)) {
                 imageGenStepIndices.add(globalStepIdx);
@@ -522,9 +572,18 @@ export function processSteps(steps: Array<Record<string, unknown>>): TokenUsageR
                         responseOutputTokens,
                         cacheReadTokens
                     };
+                    // Buffer for deferred push after model detection (with dedup)
+                    const cpKey = `${inputTokens}:${outputTokens}`;
+                    if (!seenCheckpoints.has(cpKey)) {
+                        seenCheckpoints.add(cpKey);
+                        pendingCp = { inputTokens, outputTokens };
+                    }
                     // Reset per-checkpoint counters
                     estimationOverhead = 0;
                     outputTokensSinceCheckpoint = 0;
+                    // Reset per-model delta tracking on checkpoint
+                    postCpModelDeltas.clear();
+                    prevOverhead = 0;
                 }
             }
         }
@@ -561,7 +620,8 @@ export function processSteps(steps: Array<Record<string, unknown>>): TokenUsageR
         }
 
         // Track the latest model used (for dynamic model switching)
-        if (stepModel) {
+        // Only update if it's a known primary model, or if we have no model yet
+        if (stepModel && (PRIMARY_MODELS.has(stepModel) || !model)) {
             model = stepModel;
         }
 
@@ -569,7 +629,9 @@ export function processSteps(steps: Array<Record<string, unknown>>): TokenUsageR
         // generatorModel because it reflects what the LS actually used for
         // that checkpoint's inference. Applied after generatorModel but
         // before requestedModel (user's explicit selection wins).
-        if (lastModelUsage && lastModelUsage.model) {
+        // Only update if it's a known primary model, or if we have no model yet
+        if (lastModelUsage && lastModelUsage.model &&
+            (PRIMARY_MODELS.has(lastModelUsage.model) || !model)) {
             model = lastModelUsage.model;
         }
 
@@ -577,6 +639,18 @@ export function processSteps(steps: Array<Record<string, unknown>>): TokenUsageR
         const rm = meta.requestedModel as Record<string, unknown> | undefined;
         if (rm?.model) {
             model = rm.model as string;
+        }
+
+        // Deferred checkpoint push: now that model has been fully resolved
+        // (generatorModel → lastModelUsage → requestedModel), push with
+        // the correct effective model for cost attribution.
+        if (pendingCp) {
+            checkpointUsages.push({
+                model: model || '',
+                inputTokens: pendingCp.inputTokens,
+                outputTokens: pendingCp.outputTokens
+            });
+            pendingCp = null;
         }
     }
 
@@ -606,6 +680,8 @@ export function processSteps(steps: Array<Record<string, unknown>>): TokenUsageR
             hasGaps: false,  // Set by getTrajectoryTokenUsage caller
             checkpointCompressionDetected,
             checkpointCompressionDrop,
+            checkpointUsages,
+            postCheckpointModelDeltas: Array.from(postCpModelDeltas.entries()).filter(([, d]) => d > 0).map(([m, d]) => ({ model: m, inputTokens: d, outputTokens: 0 })),
         };
     }
 
@@ -632,6 +708,8 @@ export function processSteps(steps: Array<Record<string, unknown>>): TokenUsageR
         hasGaps: false,  // Set by getTrajectoryTokenUsage caller
         checkpointCompressionDetected: false, // No checkpoints = no compression detection possible
         checkpointCompressionDrop: 0,
+        checkpointUsages: [],
+        postCheckpointModelDeltas: [],
     };
 }
 
@@ -826,5 +904,7 @@ export async function getContextUsage(
         compressionDetected: result.checkpointCompressionDetected,
         checkpointCompressionDrop: result.checkpointCompressionDrop,
         hasGaps: result.hasGaps,
+        checkpointUsages: result.checkpointUsages,
+        postCheckpointModelDeltas: result.postCheckpointModelDeltas,
     };
 }

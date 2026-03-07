@@ -11,12 +11,15 @@ import {
     TrajectorySummary
 } from './tracker';
 import { StatusBarManager, formatContextLimit } from './statusbar';
+import { UsageStore } from './usageStore';
+import { UsageReportPanel } from './webviewPanel';
 
 // ─── Extension State ──────────────────────────────────────────────────────────
 // Each VS Code window runs its own extension instance, so module-level
 // variables are window-isolated — perfect for per-window cascade tracking.
 
 let statusBar: StatusBarManager;
+let usageStore: UsageStore;
 let pollingTimer: NodeJS.Timeout | undefined;
 let cachedLsInfo: LSInfo | null = null;
 let currentUsage: ContextUsage | null = null;
@@ -99,6 +102,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     statusBar = new StatusBarManager();
+    usageStore = new UsageStore(context.globalState);
 
     // Register commands
     context.subscriptions.push(
@@ -112,6 +116,9 @@ export function activate(context: vscode.ExtensionContext): void {
             currentIntervalMs = baseIntervalMs;
             restartPolling();
             pollContextUsage();
+        }),
+        vscode.commands.registerCommand('antigravity-context-monitor.showUsageReport', () => {
+            UsageReportPanel.createOrShow(extensionContext, usageStore);
         }),
         statusBar,
         outputChannel
@@ -270,12 +277,9 @@ async function pollContextUsage(): Promise<void> {
         // If none of these fire, we show idle — this is correct for new
         // conversations that haven't registered in the LS yet.
 
-        const qualifiedTrajectories = trajectories.filter(t => {
-            if (workspaceUri) {
-                return t.workspaceUris.some(u => normalizeUri(u) === normalizedWs);
-            }
-            return t.workspaceUris.length === 0;
-        });
+        // MODIFIED: Disabled workspace filtering for cost monitoring —
+        // show ALL trajectories regardless of workspace.
+        const qualifiedTrajectories = trajectories;
 
         const qualifiedRunning = qualifiedTrajectories.filter(t => t.status === 'CASCADE_RUN_STATUS_RUNNING');
         let newCandidateId: string | null = null;
@@ -449,7 +453,8 @@ async function pollContextUsage(): Promise<void> {
         previousContextUsedMap.set(currentUsage.cascadeId, currentUsage.contextUsed);
 
         const sourceLabel = currentUsage.isEstimated ? 'estimated' : 'precise';
-        log(`Context: ${currentUsage.contextUsed} tokens (${sourceLabel}) | ${currentUsage.usagePercent.toFixed(1)}% | modelOut=${currentUsage.totalOutputTokens} | toolOut=${currentUsage.totalToolCallOutputTokens} | delta=${currentUsage.estimatedDeltaSinceCheckpoint} | imageGen=${currentUsage.imageGenStepCount}`);
+        const cpModels = currentUsage.checkpointUsages?.map(cp => `${cp.model || '(empty)'}:in=${cp.inputTokens},out=${cp.outputTokens}`).join('; ') || 'none';
+        log(`Context: ${currentUsage.contextUsed} tokens (${sourceLabel}) | ${currentUsage.usagePercent.toFixed(1)}% | modelOut=${currentUsage.totalOutputTokens} | toolOut=${currentUsage.totalToolCallOutputTokens} | delta=${currentUsage.estimatedDeltaSinceCheckpoint} | imageGen=${currentUsage.imageGenStepCount} | checkpoints=${currentUsage.checkpointUsages?.length || 0} [${cpModels}]`);
 
         // 6. Background: compute usage for other recent trajectories
         // M1 fix: Use Promise.all for parallel computation instead of serial await.
@@ -470,6 +475,13 @@ async function pollContextUsage(): Promise<void> {
         });
         const usageResults = await Promise.all(usagePromises);
         allTrajectoryUsages = usageResults.filter((u): u is ContextUsage => u !== null);
+
+        // 6b. Feed UsageStore with all resolved usages
+        for (const usage of allTrajectoryUsages) {
+            usageStore.record(usage);
+        }
+        usageStore.persist();
+        UsageReportPanel.refreshIfVisible();
 
         // 7. Update baselines for next poll
         updateBaselines(trajectories);

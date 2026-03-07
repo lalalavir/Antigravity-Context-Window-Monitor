@@ -74,12 +74,135 @@ export function extractPort(line: string): number | null {
  * CR-#3: Accepts AbortSignal for cancellation on extension deactivate.
  */
 export async function discoverLanguageServer(workspaceUri?: string, signal?: AbortSignal): Promise<LSInfo | null> {
+    if (process.platform === 'win32') {
+        return discoverLanguageServerWindows(workspaceUri, signal);
+    }
+    return discoverLanguageServerMacOS(workspaceUri, signal);
+}
+
+// ─── Windows Discovery ───────────────────────────────────────────────────────
+
+/**
+ * Filter wmic output blocks for LS processes.
+ */
+export function filterWmicProcessBlocks(wmicOutput: string): Array<{ cmd: string; pid: string }> {
+    const results: Array<{ cmd: string; pid: string }> = [];
+    let current: { cmd?: string; pid?: string } = {};
+    for (const line of wmicOutput.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('CommandLine=')) {
+            current.cmd = trimmed.substring(12);
+        } else if (trimmed.startsWith('ProcessId=')) {
+            current.pid = trimmed.substring(10);
+            if (current.cmd) {
+                results.push({ cmd: current.cmd, pid: current.pid });
+            }
+            current = {};
+        }
+    }
+    return results.filter(p =>
+        p.cmd.toLowerCase().includes('language_server') &&
+        p.cmd.toLowerCase().includes('antigravity') &&
+        !p.cmd.toLowerCase().includes('wmic')
+    );
+}
+
+/**
+ * Extract listening port from netstat output for a given PID.
+ */
+export function extractPortFromNetstat(netstatOutput: string, pid: string): number | null {
+    for (const line of netstatOutput.split('\n')) {
+        if (line.includes('LISTENING') && line.trim().endsWith(pid)) {
+            const m = line.match(/127\.0\.0\.1:(\d+)/);
+            if (m) { return parseInt(m[1], 10); }
+        }
+    }
+    return null;
+}
+
+/**
+ * Windows LS discovery using wmic + netstat.
+ */
+async function discoverLanguageServerWindows(workspaceUri?: string, signal?: AbortSignal): Promise<LSInfo | null> {
     try {
-        // 1. Find all LS processes
-        // S2/S3: async execFile — does not block the Extension Host event loop,
-        // and does not spawn a shell (no command injection risk).
-        // We use `ps -ax -o pid=,command=` to list all processes, then filter in JS
-        // instead of piping through grep (execFile does not support shell pipes).
+        // 1. Find LS processes via wmic
+        let wmicOutput: string;
+        try {
+            const result = await execFileAsync('wmic', [
+                'process', 'where',
+                "commandline like '%language_server%'",
+                'get', 'ProcessId,CommandLine',
+                '/format:list'
+            ], { encoding: 'utf-8', timeout: 10000, signal });
+            wmicOutput = result.stdout;
+        } catch {
+            return null;
+        }
+
+        const processes = filterWmicProcessBlocks(wmicOutput);
+        if (processes.length === 0) { return null; }
+
+        // Match workspace if provided
+        let target = processes[0];
+        if (workspaceUri) {
+            const expectedWsId = buildExpectedWorkspaceId(workspaceUri);
+            const matched = processes.find(p => {
+                const wsId = extractWorkspaceId(p.cmd);
+                return wsId === expectedWsId;
+            });
+            if (matched) { target = matched; }
+        }
+
+        const pid = parseInt(target.pid, 10);
+        if (isNaN(pid)) { return null; }
+
+        const csrfToken = extractCsrfToken(target.cmd);
+        if (!csrfToken) { return null; }
+
+        // 2. Find listening port via netstat
+        let netstatOutput: string;
+        try {
+            const result = await execFileAsync('netstat', ['-ano'], {
+                encoding: 'utf-8', timeout: 10000, signal
+            });
+            netstatOutput = result.stdout;
+        } catch {
+            return null;
+        }
+
+        // Collect all ports for this PID
+        const ports: number[] = [];
+        for (const line of netstatOutput.split('\n')) {
+            if (line.includes('LISTENING') && line.trim().endsWith(String(pid))) {
+                const m = line.match(/127\.0\.0\.1:(\d+)/);
+                if (m) { ports.push(parseInt(m[1], 10)); }
+            }
+        }
+        if (ports.length === 0) { return null; }
+
+        // 3. Probe ports
+        for (const port of ports) {
+            const httpsResult = await probePort(port, csrfToken, true, signal);
+            if (httpsResult) {
+                return { pid, csrfToken, port, useTls: true };
+            }
+            const httpResult = await probePort(port, csrfToken, false, signal);
+            if (httpResult) {
+                return { pid, csrfToken, port, useTls: false };
+            }
+        }
+
+        // Fallback: return first port without probe
+        return { pid, csrfToken, port: ports[0], useTls: true };
+    } catch {
+        return null;
+    }
+}
+
+// ─── macOS Discovery ─────────────────────────────────────────────────────────
+
+async function discoverLanguageServerMacOS(workspaceUri?: string, signal?: AbortSignal): Promise<LSInfo | null> {
+    try {
         let psOutput: string;
         try {
             const result = await execFileAsync('ps', ['-ax', '-o', 'pid=,command='], {
@@ -93,45 +216,25 @@ export async function discoverLanguageServer(workspaceUri?: string, signal?: Abo
         }
 
         const lines = filterLsProcessLines(psOutput);
+        if (lines.length === 0) { return null; }
 
-        if (lines.length === 0) {
-            return null;
-        }
-
-        let targetLine = lines[0]; // fallback to first if no specific match
-
+        let targetLine = lines[0];
         if (workspaceUri) {
-            // Antigravity replaces ':///' with '_' and '/' with '_' for the workspace_id arg
-            // e.g. file:///Users/foo/bar -> file_Users_foo_bar
             const expectedWorkspaceId = buildExpectedWorkspaceId(workspaceUri);
-
-            // Look for the specific process serving this workspace
             const matchedLine = lines.find(line => {
                 const wsId = extractWorkspaceId(line);
                 return wsId === expectedWorkspaceId;
             });
-
-            if (matchedLine) {
-                targetLine = matchedLine;
-            }
+            if (matchedLine) { targetLine = matchedLine; }
         }
 
         const firstLine = targetLine.trim();
-
-        // Extract PID (first number)
         const pid = extractPid(firstLine);
-        if (!pid) {
-            return null;
-        }
+        if (!pid) { return null; }
 
-        // Extract CSRF token
         const csrfToken = extractCsrfToken(firstLine);
-        if (!csrfToken) {
-            return null;
-        }
+        if (!csrfToken) { return null; }
 
-        // 2. Find listening ports
-        // S2/S3: async execFile with argument array — no shell, no injection risk.
         let lsofOutput: string;
         try {
             const result = await execFileAsync('lsof', [
@@ -142,32 +245,20 @@ export async function discoverLanguageServer(workspaceUri?: string, signal?: Abo
             return null;
         }
 
-        if (!lsofOutput) {
-            return null;
-        }
+        if (!lsofOutput) { return null; }
 
-        // Parse ports from lsof output
         const ports: number[] = [];
         for (const line of lsofOutput.split('\n')) {
             const port = extractPort(line);
-            if (port !== null) {
-                ports.push(port);
-            }
+            if (port !== null) { ports.push(port); }
         }
+        if (ports.length === 0) { return null; }
 
-        if (ports.length === 0) {
-            return null;
-        }
-
-        // 3. Probe each port to find the Connect-RPC endpoint
         for (const port of ports) {
-            // Try HTTPS first (LS typically uses self-signed cert)
             const httpsResult = await probePort(port, csrfToken, true, signal);
             if (httpsResult) {
                 return { pid, csrfToken, port, useTls: true };
             }
-
-            // Fallback to HTTP
             const httpResult = await probePort(port, csrfToken, false, signal);
             if (httpResult) {
                 return { pid, csrfToken, port, useTls: false };

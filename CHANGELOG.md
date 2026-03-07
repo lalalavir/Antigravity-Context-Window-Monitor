@@ -1,5 +1,24 @@
 # Changelog / 变更日志
 
+## [1.6.0] - 2026-03-07
+
+### Added / 新增
+
+- **Usage Report Webview / 用量报告面板**: New "Show Usage Report" command opens a Webview panel with rolling 7-day token usage statistics — daily breakdown, per-model cost analysis, and summary cards. Click the status bar item to open instantly.  
+  新增"显示用量报告"命令，在 Webview 面板中展示滚动 7 天的 token 用量统计——每日明细、按模型费用分析和汇总卡片。点击状态栏直接打开。
+
+- **Incremental Usage Store / 增量用量存储**: Token usage data is accumulated during normal polling and persisted to `globalState` — the Webview reads from memory with zero RPC overhead.  
+  Token 用量数据在正常轮询中增量积累并持久化到 `globalState`——Webview 从内存直读，零 RPC 开销。
+
+- **Sliding Window Navigation / 滑动窗口导航**: Navigate through usage history with ◀/▶ buttons in 7-day increments — supports browsing all history since extension installation.  
+  通过 ◀/▶ 按钮以 7 天为单位浏览用量历史——支持查看自安装以来的所有历史数据。
+
+### Changed / 变更
+
+- **Status Bar Click Action / 状态栏点击行为**: Status bar item now opens the Usage Report Webview instead of the QuickPick details panel. QuickPick is still accessible via command palette ("Show Context Window Details").  
+  状态栏点击现在打开用量报告 Webview，而非 QuickPick 详情面板。QuickPick 仍可通过命令面板访问。
+
+
 ## [1.5.3] - 2026-02-22
 
 ### Fixed (Medium) / 修复（中等）

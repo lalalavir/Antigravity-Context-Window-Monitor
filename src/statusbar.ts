@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { ContextUsage } from './tracker';
+import { calculateCost, formatCost, costTooltipLines, calculateSegmentedCost, segmentedCostTooltipLines } from './cost';
 
 // ─── Token Formatting ─────────────────────────────────────────────────────────
 
@@ -129,7 +130,7 @@ export class StatusBarManager {
             vscode.StatusBarAlignment.Right,
             100
         );
-        this.statusBarItem.command = 'antigravity-context-monitor.showDetails';
+        this.statusBarItem.command = 'antigravity-context-monitor.showUsageReport';
         this.statusBarItem.name = 'Context Window Monitor / 上下文窗口监控';
         this.showInitializing();
         this.statusBarItem.show();
@@ -208,7 +209,32 @@ export class StatusBarManager {
         // so users can see data incompleteness without hovering.
         const gapsIndicator = usage.hasGaps ? ' ⚠️' : '';
 
-        this.statusBarItem.text = `${icon} ${usedStr}/${limitStr}, ${displayPercent}%${compressIcon}${gapsIndicator}`;
+        // Calculate equivalent API cost — use segmented cost when checkpoint data exists
+        const hasCheckpoints = usage.checkpointUsages && usage.checkpointUsages.length > 0;
+        let cost: number;
+        let costStr: string;
+        const inputTokens = usage.lastModelUsage?.inputTokens || usage.contextUsed;
+        const outputTokens = usage.totalOutputTokens || 0;
+
+        // Build augmented checkpoint array: append per-model deltas computed by
+        // processSteps (overhead since last checkpoint, split by model).
+        // This data persists regardless of the user's current model selection,
+        // so switching models in the UI won't hide previously accumulated costs.
+        let augmentedCheckpoints = usage.checkpointUsages || [];
+        if (usage.postCheckpointModelDeltas && usage.postCheckpointModelDeltas.length > 0) {
+            augmentedCheckpoints = [...usage.checkpointUsages, ...usage.postCheckpointModelDeltas];
+        }
+
+        if (hasCheckpoints) {
+            const segmented = calculateSegmentedCost(augmentedCheckpoints);
+            cost = segmented.total;
+            costStr = formatCost(cost);
+        } else {
+            cost = calculateCost(usage.model, inputTokens, outputTokens);
+            costStr = formatCost(cost);
+        }
+
+        this.statusBarItem.text = `${icon} ${usedStr}/${limitStr}, ${displayPercent}%${compressIcon}${gapsIndicator} | ${costStr}`;
         this.statusBarItem.backgroundColor = getSeverityColor(severity);
 
         // Build detailed tooltip (m5: escape dynamic content for Markdown safety)
@@ -274,6 +300,17 @@ export class StatusBarManager {
         // Show estimation delta if applicable
         if (usage.estimatedDeltaSinceCheckpoint > 0 && usage.lastModelUsage) {
             lines.push(`📏 Est. delta / 估算增量: +${usage.estimatedDeltaSinceCheckpoint.toLocaleString()} tokens (since last checkpoint / 自上次检查点)`);
+        }
+
+        // Cost section — use segmented breakdown for multi-model, single-model otherwise
+        lines.push(`——————————`);
+        if (hasCheckpoints) {
+            const segmented = calculateSegmentedCost(augmentedCheckpoints);
+            const segLines = segmentedCostTooltipLines(segmented.segments, segmented.total);
+            for (const cl of segLines) { lines.push(cl); }
+        } else {
+            const singleCostLines = costTooltipLines(usage.model, inputTokens, outputTokens, cost);
+            for (const cl of singleCostLines) { lines.push(cl); }
         }
 
         lines.push(`——————————`);
