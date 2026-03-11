@@ -84,6 +84,7 @@ export async function discoverLanguageServer(workspaceUri?: string, signal?: Abo
 
 /**
  * Filter wmic output blocks for LS processes.
+ * @deprecated Kept for backward compatibility on older Windows versions.
  */
 export function filterWmicProcessBlocks(wmicOutput: string): Array<{ cmd: string; pid: string }> {
     const results: Array<{ cmd: string; pid: string }> = [];
@@ -108,6 +109,30 @@ export function filterWmicProcessBlocks(wmicOutput: string): Array<{ cmd: string
 }
 
 /**
+ * Parse PowerShell JSON output from Get-CimInstance into process entries.
+ * Handles both single-object and array JSON output.
+ */
+export function parsePowerShellProcesses(jsonOutput: string): Array<{ cmd: string; pid: string }> {
+    try {
+        const trimmed = jsonOutput.trim();
+        if (!trimmed) { return []; }
+        const parsed = JSON.parse(trimmed);
+        const items: Array<Record<string, unknown>> = Array.isArray(parsed) ? parsed : [parsed];
+        return items
+            .filter(item => {
+                const cmd = String(item.CommandLine || '').toLowerCase();
+                return cmd.includes('language_server') && cmd.includes('antigravity');
+            })
+            .map(item => ({
+                cmd: String(item.CommandLine || ''),
+                pid: String(item.ProcessId || ''),
+            }));
+    } catch {
+        return [];
+    }
+}
+
+/**
  * Extract listening port from netstat output for a given PID.
  */
 export function extractPortFromNetstat(netstatOutput: string, pid: string): number | null {
@@ -121,25 +146,56 @@ export function extractPortFromNetstat(netstatOutput: string, pid: string): numb
 }
 
 /**
- * Windows LS discovery using wmic + netstat.
+ * Find LS processes on Windows.
+ * Primary: PowerShell Get-CimInstance with WQL filter (works on all modern Windows).
+ * Fallback: wmic (deprecated, removed in Windows 11 23H2+) — only attempted if wmic exists.
+ */
+async function findWindowsLsProcesses(signal?: AbortSignal): Promise<Array<{ cmd: string; pid: string }>> {
+    // Primary: PowerShell Get-CimInstance with server-side WQL filter → JSON
+    try {
+        const psScript =
+            "Get-CimInstance Win32_Process " +
+            "-Filter \"CommandLine LIKE '%language_server%' AND CommandLine LIKE '%antigravity%'\" " +
+            "| Select-Object ProcessId, CommandLine " +
+            "| ConvertTo-Json -Compress";
+        const result = await execFileAsync('powershell.exe', [
+            '-NoProfile', '-NoLogo', '-Command', psScript
+        ], { encoding: 'utf-8', timeout: 15000, signal });
+        // PowerShell succeeded — trust the result even if empty (LS not running)
+        return parsePowerShellProcesses(result.stdout);
+    } catch {
+        // PowerShell itself failed (e.g. not on PATH, execution policy) — try wmic
+    }
+
+    // Fallback: wmic (for older Windows that still has it)
+    // Check if wmic exists first to avoid a slow timeout on Windows 11 23H2+
+    try {
+        await execFileAsync('where.exe', ['wmic'], { encoding: 'utf-8', timeout: 3000 });
+    } catch {
+        // wmic not found — nothing more we can do
+        return [];
+    }
+
+    try {
+        const result = await execFileAsync('wmic', [
+            'process', 'where',
+            "commandline like '%language_server%'",
+            'get', 'ProcessId,CommandLine',
+            '/format:list'
+        ], { encoding: 'utf-8', timeout: 10000, signal });
+        return filterWmicProcessBlocks(result.stdout);
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Windows LS discovery using PowerShell/wmic + netstat.
  */
 async function discoverLanguageServerWindows(workspaceUri?: string, signal?: AbortSignal): Promise<LSInfo | null> {
     try {
-        // 1. Find LS processes via wmic
-        let wmicOutput: string;
-        try {
-            const result = await execFileAsync('wmic', [
-                'process', 'where',
-                "commandline like '%language_server%'",
-                'get', 'ProcessId,CommandLine',
-                '/format:list'
-            ], { encoding: 'utf-8', timeout: 10000, signal });
-            wmicOutput = result.stdout;
-        } catch {
-            return null;
-        }
-
-        const processes = filterWmicProcessBlocks(wmicOutput);
+        // 1. Find LS processes
+        const processes = await findWindowsLsProcesses(signal);
         if (processes.length === 0) { return null; }
 
         // Match workspace if provided
